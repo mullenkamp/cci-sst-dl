@@ -1,0 +1,133 @@
+[project]
+name = "cci-sst-dl"
+authors = [
+  { name = "mullenkamp", email = "mullenkamp1@gmail.com" }
+]
+description = ""
+readme = "README.md"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+]
+requires-python = ">=3.10"
+dependencies = [
+]
+
+[dependency-groups]
+dev = [
+  "spyder-kernels==2.5.2",
+  "black",
+  "mypy",
+  "ruff",
+  "pytest",
+  "pytest-cov",
+  "mkdocs-material",
+  "mkdocstrings[python]",
+  
+]
+
+[tool.pytest.ini_options]
+testpaths = ["cci_sst_dl/tests"]
+
+
+[tool.hatch]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.black]
+target-version = ["py310"]
+line-length = 120
+skip-string-normalization = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+  "A",
+  "ARG",
+  "B",
+  "C",
+  "DTZ",
+  "E",
+  "EM",
+  "F",
+  "FBT",
+  "I",
+  "ICN",
+  "ISC",
+  "N",
+  "PLC",
+  "PLE",
+  "PLR",
+  "PLW",
+  "Q",
+  "RUF",
+  "S",
+  "T",
+  "TID",
+  "UP",
+  "W",
+  "YTT",
+]
+ignore = [
+  # Allow non-abstract empty methods in abstract base classes
+  "B027",
+  # Allow boolean positional values in function calls, like `dict.get(... True)`
+  "FBT003",
+  # Ignore checks for possible passwords
+  "S105", "S106", "S107",
+  # Ignore complexity
+  "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915",
+]
+unfixable = [
+  # Don't touch unused imports
+  "F401",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cci_sst_dl"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests can use magic values, assertions, and relative imports
+"tests/**/*" = ["PLR2004", "S101", "TID252"]
+
+[tool.coverage.run]
+source_pkgs = ["cci_sst_dl", "tests"]
+branch = true
+parallel = true
+
+[tool.coverage.paths]
+cci_sst_dl = ["cci_sst_dl"]
+tests = ["cci_sst_dl/tests"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "no cov",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+]
+
+[build-system]
+requires = ["hatchling>=1.26.1"]
+build-backend = "hatchling.build"
+
+[project.urls]
+Documentation = "https://mullenkamp.github.io/cci-sst-dl/"
+Source = "https://github.com/cci-sst-dl"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/cci_sst_dl",
+]
+exclude = [
+    "/cci_sst_dl/tests/*",
+]
+
+[tool.hatch.version]
+path = "cci_sst_dl/__init__.py"

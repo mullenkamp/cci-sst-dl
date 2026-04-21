@@ -1,0 +1,16 @@
+services:
+  cci-sst-dl:
+    build: .
+    image: mullenkamp/cci-sst-dl:0.1
+    # Run as the host user so files written to mounted volumes (when using
+    # [remote] type='local') are owned by you, not root. Export UID and GID
+    # in the shell before invoking:
+    #   export UID=$(id -u) GID=$(id -g)
+    #   docker compose run --rm cci-sst-dl
+    # Falls back to 1000:1000 if the env vars aren't set.
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - "./parameters.toml:/parameters.toml:ro"
+      # Uncomment and adjust when using [remote] type='local' in parameters.toml
+      # with path='/data/output':
+      # - "~/data/esa/sst/v3:/data/output"

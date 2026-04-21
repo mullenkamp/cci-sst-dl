@@ -1,0 +1,48 @@
+# =============================================================================
+# Parallel download workers (default: 4). 4-8 is plenty; CEDA rate-limits single
+# connections but handles concurrent ones fine.
+# =============================================================================
+n_tasks = 8
+
+# =============================================================================
+# If true (default), skip days whose file is already on the destination. Set
+# to false to force re-download and overwrite (e.g. when the bbox has changed).
+# CLI overrides: --check-target / --no-check-target.
+# =============================================================================
+check_target = true
+
+# =============================================================================
+# Date range (inclusive). CEDA v3 currently covers 1980-01-01 through 2024-06-22
+# (verified 2026-04; the archive has not been extended past mid-2024 despite the
+# catalogue claiming daily ICDR updates).
+# =============================================================================
+[dates]
+start_date = "2023-02-01"
+end_date = "2023-02-28"
+
+# =============================================================================
+# Geographic clipping bounds (degrees). NZ-ish defaults.
+# Lat: -90 to 90. Lon: -180 to 180 (CCI uses standard CF, lat ascending).
+# =============================================================================
+[bounds]
+min_lon = 145
+max_lon = 190
+min_lat = -52
+max_lat = -15
+
+# =============================================================================
+# rclone destination. Can be S3 (as here) or a local path (type='local').
+# The script writes files at {path}/{YYYY}/<original_filename>.
+# =============================================================================
+# [remote]
+# type = 's3'
+# provider = 'Mega'
+# endpoint = 'https://s3.ca-west-1.s4.mega.io'
+# access_key_id = ''
+# secret_access_key = ''
+# path = '/data/sst/cci/v3/'
+
+# Local example (use with Docker volume mount):
+[remote]
+type = 'local'
+path = '/data/output'

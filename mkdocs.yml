@@ -1,0 +1,59 @@
+site_name: cci-sst-dl
+site_description: 
+
+repo_url: https://github.com/cci-sst-dl
+repo_name: mullenkamp/cci-sst-dl
+
+theme:
+    name: material
+    icon:
+        logo: material/library
+    palette:
+        # Palette toggle for light mode
+        - media: "(prefers-color-scheme: light)"
+          scheme: default
+          primary: light green
+          accent: amber
+          toggle:
+            icon: material/brightness-7
+            name: Switch to dark mode
+
+        # Palette toggle for dark mode
+        - media: "(prefers-color-scheme: dark)"
+          scheme: slate
+          primary: light green
+          accent: amber
+          toggle:
+            icon: material/brightness-4
+            name: Switch to light mode
+
+markdown_extensions:
+    - toc:
+        permalink: true
+    - pymdownx.highlight:
+        anchor_linenums: true
+    - pymdownx.tasklist:
+        custom_checkbox: true
+    - pymdownx.inlinehilite
+    - pymdownx.snippets
+    - pymdownx.superfences
+
+plugins:
+    - search
+    - mkdocstrings:
+        handlers:
+            python:
+                paths: [.]
+                import:
+                    - https://docs.python.org/3.10/objects.inv
+                options:
+                    docstring_style: google
+
+watch:
+    - docs
+    - cci_sst_dl
+
+nav:
+    - About: index.md
+    - Reference:
+        - cci_sst_dl: reference/cci_sst_dl.md
