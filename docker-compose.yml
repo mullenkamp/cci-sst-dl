@@ -9,6 +9,16 @@ services:
     #   docker compose run --rm cci-sst-dl
     # Falls back to 1000:1000 if the env vars aren't set.
     user: "${UID:-1000}:${GID:-1000}"
+    # Forward proxy env vars from the host (useful on university / corporate
+    # networks behind an HTTP proxy). If these vars aren't set on the host,
+    # they simply aren't defined in the container — harmless.
+    # environment:
+    #   - HTTP_PROXY
+    #   - HTTPS_PROXY
+    #   - NO_PROXY
+    #   - http_proxy
+    #   - https_proxy
+    #   - no_proxy
     volumes:
       - "./parameters.toml:/parameters.toml:ro"
       # Uncomment and adjust when using [remote] type='local' in parameters.toml

@@ -1,7 +1,7 @@
 FROM debian:13-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl nco python3 python3-pip python3-pendulum rclone \
+        ca-certificates cdo python3 python3-pip python3-pendulum rclone \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

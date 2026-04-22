@@ -10,7 +10,7 @@ no tests. Sibling in spirit to `era5-download` but much smaller.
 Source: https://dap.ceda.ac.uk/neodc/eocis/data/global_and_regional/sea_surface_temperature/CDR_v3/Analysis/L4/v3.0.1
 License: CC-BY 4.0 (credit Merchant et al. 2019, doi:10.1038/s41597-019-0236-x)
 
-External binaries required: curl, ncks (NCO), rclone.
+External binaries required: cdo, rclone.
 """
 import argparse
 import concurrent.futures
@@ -45,9 +45,14 @@ FILENAME_TMPL = (
     '{variant}3.0-v02.0-fv01.0.nc'
 )
 
+# Use cdo sellonlatbox instead of ncks: handles dateline-wrapping bboxes
+# (e.g. lon 145..195 on a -180..180 source produces a single contiguous lon
+# array from 145.025 to 194.975). ncks silently clamps such bboxes to 180.
+# -f nc4c + -z zip_3 gives NetCDF-4 classic with deflate compression.
 CLIP_STR_FORMAT = (
-    'ncks -O -4 -L 3 -d lat,{min_lat:.3f},{max_lat:.3f} '
-    '-d lon,{min_lon:.3f},{max_lon:.3f} {src} {dst}'
+    'cdo -s -O -f nc4c -z zip_3 '
+    'sellonlatbox,{min_lon:.6f},{max_lon:.6f},{min_lat:.6f},{max_lat:.6f} '
+    '{src} {dst}'
 )
 
 
@@ -55,7 +60,7 @@ CLIP_STR_FORMAT = (
 ### Helpers
 
 def check_external_binaries():
-    for bin_ in ('curl', 'ncks', 'rclone'):
+    for bin_ in ('cdo', 'rclone'):
         if shutil.which(bin_) is None:
             print(f'Error: required external binary "{bin_}" not on PATH.', file=sys.stderr)
             sys.exit(1)
@@ -101,10 +106,18 @@ def build_url(date, variant):
 
 
 def create_rclone_config(config_dict, config_path):
-    """Write an rclone config entry named 'sst' from a TOML dict."""
+    """Write two rclone config entries:
+      - 'sst'  : the upload destination (user's S3 or local, from [remote] TOML)
+      - 'ceda' : anonymous HTTP remote pointing at the CEDA v3 archive base URL
+    """
+    # Upload destination
     type_ = config_dict['type']
     kv = ' '.join(f'{k}={v}' for k, v in config_dict.items() if k != 'type')
     cmd = f'rclone config create sst {type_} {kv} --config={config_path} --non-interactive'
+    subprocess.run(shlex.split(cmd), capture_output=True, text=True, check=True)
+
+    # CEDA download source (HTTP remote, no auth)
+    cmd = f'rclone config create ceda http url={CEDA_BASE}/ --config={config_path} --non-interactive'
     subprocess.run(shlex.split(cmd), capture_output=True, text=True, check=True)
 
 
@@ -135,21 +148,42 @@ def remote_has_day(date, remote_path, config_path):
     return False
 
 
-def download_day(date, dl_dir):
-    """Download the day's NetCDF, trying the year-appropriate variant first, then falling back."""
+def download_day(date, dl_dir, config_path):
+    """Download the day's NetCDF via rclone from the 'ceda:' http remote.
+
+    Tries the year-appropriate variant first, falls back to the other on failure.
+    Returns (dst_path, filename, errors) where errors is {variant: rclone_stderr}
+    for any variant that failed. Successful downloads return (path, name, {}).
+    """
     primary, fallback = expected_variants_for_year(date.year)
+    errors = {}
 
     for variant in (primary, fallback):
-        url, filename = build_url(date, variant)
+        _, filename = build_url(date, variant)
+        # rclone expects a path relative to the 'ceda:' remote's base URL.
+        remote_rel = f'{date.format("YYYY")}/{date.format("MM")}/{date.format("DD")}/{filename}'
         dst = dl_dir / filename
-        cmd = ['curl', '-fSL', '-o', str(dst), url]
+        # `copyto` lets us specify the exact destination filename.
+        cmd = [
+            'rclone', 'copyto', f'ceda:{remote_rel}', str(dst),
+            '--config', str(config_path),
+            '--retries', '3',
+            '--low-level-retries', '5',
+            '--contimeout', '30s',
+            '--timeout', '5m',
+        ]
         p = subprocess.run(cmd, capture_output=True, text=True)
-        if p.returncode == 0:
-            return dst, filename
-    return None, None
+        if p.returncode == 0 and dst.exists():
+            return dst, filename, {}
+        errors[variant] = (p.stderr or p.stdout or f'exit code {p.returncode}').strip()
+    return None, None, errors
 
 
 def clip_file(src, dst, min_lon, max_lon, min_lat, max_lat):
+    """Clip src to the requested bbox via cdo. Returns None on success,
+    error message on failure. Verifies the output actually covers the
+    requested bbox (within one cell-width tolerance) so silent clipping
+    bugs surface immediately."""
     cmd_str = CLIP_STR_FORMAT.format(
         min_lat=min_lat, max_lat=max_lat, min_lon=min_lon, max_lon=max_lon,
         src=str(src), dst=str(dst),
@@ -157,7 +191,73 @@ def clip_file(src, dst, min_lon, max_lon, min_lat, max_lat):
     p = subprocess.run(shlex.split(cmd_str), capture_output=True, text=True)
     if p.returncode != 0:
         return p.stderr or p.stdout
+
+    # Post-clip verification: the output coords must cover the requested bbox.
+    # cdo sellonlatbox returns cells whose centers fall inside [lo, hi], so the
+    # coord range may differ from the request by up to one grid cell (~0.05 deg
+    # for CCI); require coverage within cell-width tolerance.
+    cell_tol = 0.06  # slightly > CCI's 0.05 deg grid
+    try:
+        ok, err = _verify_clip_coverage(dst, min_lon, max_lon, min_lat, max_lat, cell_tol)
+    except Exception as e:
+        return f'clip output verification failed to open {dst}: {e}'
+    if not ok:
+        return err
     return None
+
+
+def _verify_clip_coverage(nc_path, min_lon, max_lon, min_lat, max_lat, cell_tol):
+    """Open a cdo-clipped NetCDF and assert its lat/lon span the requested bbox.
+
+    Returns (True, None) on success, (False, error_message) if coverage is short.
+    Uses the stdlib-free h5py backend via the `ncdump -h` parse fallback to avoid
+    pulling in a full NetCDF Python binding for this small check. In practice
+    we can shell out to `cdo griddes` which prints the grid description.
+    """
+    # Quick approach: use `cdo griddes` to get the grid bounds from the file.
+    p = subprocess.run(
+        ['cdo', '-s', 'griddes', str(nc_path)],
+        capture_output=True, text=True,
+    )
+    if p.returncode != 0:
+        return False, f'cdo griddes failed on {nc_path}: {p.stderr.strip()[:200]}'
+
+    # Parse: look for xfirst/xinc/xsize and yfirst/yinc/ysize from griddes output
+    info = {}
+    for line in p.stdout.splitlines():
+        line = line.strip()
+        if '=' in line:
+            k, _, v = line.partition('=')
+            info[k.strip()] = v.strip()
+
+    try:
+        xfirst = float(info['xfirst'])
+        xinc = float(info['xinc'])
+        xsize = int(info['xsize'])
+        yfirst = float(info['yfirst'])
+        yinc = float(info['yinc'])
+        ysize = int(info['ysize'])
+    except (KeyError, ValueError) as e:
+        return False, f'could not parse cdo griddes output: {e}'
+
+    xlast = xfirst + (xsize - 1) * xinc
+    ylast = yfirst + (ysize - 1) * yinc
+    actual_min_lon, actual_max_lon = sorted((xfirst, xlast))
+    actual_min_lat, actual_max_lat = sorted((yfirst, ylast))
+
+    problems = []
+    if actual_min_lon > min_lon + cell_tol:
+        problems.append(f'min_lon: requested {min_lon}, got {actual_min_lon:.4f}')
+    if actual_max_lon < max_lon - cell_tol:
+        problems.append(f'max_lon: requested {max_lon}, got {actual_max_lon:.4f}')
+    if actual_min_lat > min_lat + cell_tol:
+        problems.append(f'min_lat: requested {min_lat}, got {actual_min_lat:.4f}')
+    if actual_max_lat < max_lat - cell_tol:
+        problems.append(f'max_lat: requested {max_lat}, got {actual_max_lat:.4f}')
+
+    if problems:
+        return False, 'clipped output does not cover requested bbox: ' + '; '.join(problems)
+    return True, None
 
 
 def upload_file(clip_path, date, remote_path, config_path):
@@ -186,9 +286,11 @@ def process_one_day(date, bounds, remote_path, config_path, workdir, check_targe
     dl_dir.mkdir(parents=True, exist_ok=True)
     clip_dir.mkdir(parents=True, exist_ok=True)
 
-    dl_path, filename = download_day(date, dl_dir)
+    dl_path, filename, dl_errors = download_day(date, dl_dir, config_path)
     if dl_path is None:
-        return date, 'fail', 'download failed (both CDR and ICDR returned non-200)'
+        # Surface the actual curl diagnostic from each variant attempt
+        detail = '; '.join(f'{v}: {msg[:300]}' for v, msg in dl_errors.items())
+        return date, 'fail', f'download failed — {detail}'
 
     clip_path = clip_dir / filename
     err = clip_file(

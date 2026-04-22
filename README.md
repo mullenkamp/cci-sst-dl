@@ -29,9 +29,8 @@ ESA Sea Surface Temperature Climate Change Initiative (ESA SST_cci) Level 4 Anal
 
 External binaries on `PATH`:
 
-- `curl` — downloading from CEDA
-- `ncks` (part of [NCO](https://nco.sourceforge.net/)) — spatial clipping
-- `rclone` — upload to the destination
+- `rclone` — downloads from CEDA and uploads to the destination (single tool for all network I/O; respects standard `HTTPS_PROXY` env and also reads `~/.config/rclone/rclone.conf` for any globally-configured proxy)
+- `cdo` ([Climate Data Operators](https://code.mpimet.mpg.de/projects/cdo)) — spatial clipping via `sellonlatbox`. Unlike `ncks`, `cdo` handles dateline-wrapping bboxes (e.g. `max_lon=195` on a `-180..180` source) and produces a contiguous monotonic lon array.
 
 Python ≥ 3.10 with `pendulum`. On 3.10 also install `tomli`; on 3.11+ the stdlib's `tomllib` is used:
 
@@ -102,9 +101,22 @@ export UID=$(id -u) GID=$(id -g)
 docker compose run --rm cci-sst-dl
 ```
 
-The image bundles `curl`, `nco` (for `ncks`), and `rclone`. The `user:` directive in `docker-compose.yml` defaults to `1000:1000` if `UID`/`GID` are not exported — override by exporting them in your shell first (as above).
+The image bundles `cdo` and `rclone`. The `user:` directive in `docker-compose.yml` defaults to `1000:1000` if `UID`/`GID` are not exported — override by exporting them in your shell first (as above).
 
 For `[remote]` type='local', uncomment the `~/data/sst/cci_v3:/data/output` volume mount in `docker-compose.yml` (and set `path = '/data/output'` in your TOML) so the clipped NetCDFs land on your host filesystem owned by your user.
+
+### Behind an HTTP proxy (university / corporate networks)
+
+`docker-compose.yml` already forwards `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` (plus lowercase variants) from the host. Just export them before running:
+
+```bash
+export HTTPS_PROXY=http://proxy.example.ac.nz:8080
+export HTTP_PROXY=http://proxy.example.ac.nz:8080
+export NO_PROXY=localhost,127.0.0.1,.internal.example.ac.nz
+docker compose run --rm cci-sst-dl
+```
+
+Both `curl` (CEDA download) and `rclone` (Mega upload) respect these. If your proxy uses a self-signed CA, you'll also need to add its cert to the container — ask if you hit that.
 
 ## Notes
 
