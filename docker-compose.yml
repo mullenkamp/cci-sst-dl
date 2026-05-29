@@ -1,7 +1,7 @@
 services:
   cci-sst-dl:
     build: .
-    image: mullenkamp/cci-sst-dl:0.1
+    image: mullenkamp/cci-sst-dl:0.2
     # Run as the host user so files written to mounted volumes (when using
     # [remote] type='local') are owned by you, not root. Export UID and GID
     # in the shell before invoking:
@@ -21,6 +21,13 @@ services:
     #   - no_proxy
     volumes:
       - "./parameters.toml:/parameters.toml:ro"
+      # /work is the writable host-project-dir mount where failures.txt lands
+      # after each run (entry-point passes --failures-file /work/failures.txt).
+      # Mounting the host project dir here means failures.txt shows up on the
+      # host next to parameters.toml automatically — no extra setup needed.
+      # Override with `--failures-file` on the command line if you want it
+      # somewhere else.
+      - "./:/work"
       # Uncomment and adjust when using [remote] type='local' in parameters.toml
       # with path='/data/output':
       # - "~/data/esa/sst/v3:/data/output"

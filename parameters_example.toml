@@ -12,9 +12,40 @@ n_tasks = 8
 check_target = true
 
 # =============================================================================
+# Per-date retry with exponential backoff for transient CEDA failures (e.g.
+# rclone "directory not found" 404s on files that actually exist). Both
+# variants (CDR + ICDR) are tried once per attempt; if BOTH fail, sleep and
+# retry the pair. The common-case success path (CDR succeeds first try) has
+# zero overhead — no sleeps, no extra log lines.
+#
+# Defaults below give delays 30s, 60s, 120s between attempts (≈3.5 min
+# worst-case latency per failing date before giving up). CLI overrides:
+# --max-retries / --retry-initial-delay / --retry-backoff.
+# =============================================================================
+max_retries = 3                  # number of retries after the initial attempt fails
+retry_initial_delay = 30         # seconds before the first retry
+retry_backoff = 2.0              # multiplier applied after each retry
+
+# =============================================================================
+# Where to write the failures-list file at end of run. One YYYY-MM-DD per
+# line; empty file if all succeeded. The file is overwritten on every run, so
+# it always reflects the latest state.
+#
+# Pair with the CLI flag `--from-failures <path>` on a follow-up invocation
+# to re-process only those dates (typically run a few hours later when CEDA
+# has recovered). Iterating until the file is empty converges to a complete
+# archive without re-processing any successful dates.
+#
+# Default (when this key is commented out): <parameters.toml dir>/failures.txt.
+# =============================================================================
+# failures_file = '/data/output/failures.txt'
+
+# =============================================================================
 # Date range (inclusive). CEDA v3 currently covers 1980-01-01 through 2024-06-22
 # (verified 2026-04; the archive has not been extended past mid-2024 despite the
 # catalogue claiming daily ICDR updates).
+#
+# Ignored when --from-failures is given.
 # =============================================================================
 [dates]
 start_date = "2023-02-01"

@@ -14,11 +14,13 @@ External binaries required: cdo, rclone.
 """
 import argparse
 import concurrent.futures
+import random
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -88,7 +90,38 @@ def apply_overrides(params, args):
         params['n_tasks'] = args.n_tasks
     if args.check_target is not None:
         params['check_target'] = args.check_target
+    if args.max_retries is not None:
+        params['max_retries'] = args.max_retries
+    if args.retry_initial_delay is not None:
+        params['retry_initial_delay'] = args.retry_initial_delay
+    if args.retry_backoff is not None:
+        params['retry_backoff'] = args.retry_backoff
+    if args.failures_file is not None:
+        params['failures_file'] = str(args.failures_file)
     return params
+
+
+def load_failures_file(path):
+    """Load a list of dates from a one-date-per-line file.
+
+    Format: one ISO date (YYYY-MM-DD) per line. Blank lines and lines whose
+    first non-whitespace character is `#` are silently skipped. Returns a sorted
+    list of unique pendulum.date objects.
+    """
+    dates = set()
+    with open(path) as f:
+        for lineno, raw in enumerate(f, start=1):
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            try:
+                d = pendulum.parse(line).date()
+            except Exception as exc:
+                raise ValueError(
+                    f'Bad date on line {lineno} of {path}: {line!r} ({exc})'
+                ) from exc
+            dates.add(d)
+    return sorted(dates)
 
 
 def date_range(start_date, end_date):
@@ -148,34 +181,62 @@ def remote_has_day(date, remote_path, config_path):
     return False
 
 
-def download_day(date, dl_dir, config_path):
+def download_day(date, dl_dir, config_path,
+                 max_retries=3, retry_initial_delay=30, retry_backoff=2.0):
     """Download the day's NetCDF via rclone from the 'ceda:' http remote.
 
     Tries the year-appropriate variant first, falls back to the other on failure.
+    If BOTH variants fail in one round, sleep with exponential backoff and retry
+    up to max_retries times — this handles transient CEDA "directory not found"
+    errors where the file does exist but the server momentarily can't serve it.
+    rclone's own --retries / --low-level-retries flags only cover transient
+    connection errors within a single invocation; a 404 is treated as permanent
+    and gives up immediately, so this outer loop is what saves the day.
+
     Returns (dst_path, filename, errors) where errors is {variant: rclone_stderr}
-    for any variant that failed. Successful downloads return (path, name, {}).
+    for any variant that failed in the final attempt. Successful downloads
+    return (path, name, {}).
     """
     primary, fallback = expected_variants_for_year(date.year)
+    delay = retry_initial_delay
     errors = {}
 
-    for variant in (primary, fallback):
-        _, filename = build_url(date, variant)
-        # rclone expects a path relative to the 'ceda:' remote's base URL.
-        remote_rel = f'{date.format("YYYY")}/{date.format("MM")}/{date.format("DD")}/{filename}'
-        dst = dl_dir / filename
-        # `copyto` lets us specify the exact destination filename.
-        cmd = [
-            'rclone', 'copyto', f'ceda:{remote_rel}', str(dst),
-            '--config', str(config_path),
-            '--retries', '3',
-            '--low-level-retries', '5',
-            '--contimeout', '30s',
-            '--timeout', '5m',
-        ]
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        if p.returncode == 0 and dst.exists():
-            return dst, filename, {}
-        errors[variant] = (p.stderr or p.stdout or f'exit code {p.returncode}').strip()
+    for attempt in range(max_retries + 1):
+        errors = {}
+        for variant in (primary, fallback):
+            _, filename = build_url(date, variant)
+            # rclone expects a path relative to the 'ceda:' remote's base URL.
+            remote_rel = f'{date.format("YYYY")}/{date.format("MM")}/{date.format("DD")}/{filename}'
+            dst = dl_dir / filename
+            # `copyto` lets us specify the exact destination filename.
+            cmd = [
+                'rclone', 'copyto', f'ceda:{remote_rel}', str(dst),
+                '--config', str(config_path),
+                '--retries', '3',
+                '--low-level-retries', '5',
+                '--contimeout', '30s',
+                '--timeout', '5m',
+            ]
+            p = subprocess.run(cmd, capture_output=True, text=True)
+            if p.returncode == 0 and dst.exists():
+                return dst, filename, {}
+            errors[variant] = (p.stderr or p.stdout or f'exit code {p.returncode}').strip()
+
+        # Both variants failed this attempt. Back off and try again if we have retries left.
+        if attempt < max_retries:
+            # Jitter the actual sleep over [0.5*delay, 1.5*delay) so parallel workers
+            # don't all wake at the exact same instant and re-trigger CEDA's rate
+            # limiter as a thundering herd. `delay` (the base) still grows by
+            # retry_backoff per attempt, so worst-case bound is preserved.
+            sleep_s = max(1, int(delay * (0.5 + random.random())))
+            print(
+                f'[retry {attempt+1}/{max_retries}] {date.format("YYYY-MM-DD")}: '
+                f'both variants failed; sleeping {sleep_s}s before next attempt',
+                flush=True,
+            )
+            time.sleep(sleep_s)
+            delay = int(delay * retry_backoff)
+
     return None, None, errors
 
 
@@ -270,13 +331,18 @@ def upload_file(clip_path, date, remote_path, config_path):
     return None
 
 
-def process_one_day(date, bounds, remote_path, config_path, workdir, check_target):
+def process_one_day(date, bounds, remote_path, config_path, workdir, check_target,
+                    max_retries=3, retry_initial_delay=30, retry_backoff=2.0):
     """Download → clip → upload a single day. Returns (date, status, msg).
 
     status is one of 'ok', 'skip', 'fail'. If check_target is True and the
     remote already has a file for this date (either CDR or ICDR variant), the
     day is skipped. Set check_target=False to always re-download (e.g. after
     changing the bbox).
+
+    max_retries / retry_initial_delay / retry_backoff control the
+    exponential-backoff retry on transient CEDA download failures. See
+    download_day for details.
     """
     if check_target and remote_has_day(date, remote_path, config_path):
         return date, 'skip', None
@@ -286,7 +352,12 @@ def process_one_day(date, bounds, remote_path, config_path, workdir, check_targe
     dl_dir.mkdir(parents=True, exist_ok=True)
     clip_dir.mkdir(parents=True, exist_ok=True)
 
-    dl_path, filename, dl_errors = download_day(date, dl_dir, config_path)
+    dl_path, filename, dl_errors = download_day(
+        date, dl_dir, config_path,
+        max_retries=max_retries,
+        retry_initial_delay=retry_initial_delay,
+        retry_backoff=retry_backoff,
+    )
     if dl_path is None:
         # Surface the actual curl diagnostic from each variant attempt
         detail = '; '.join(f'{v}: {msg[:300]}' for v, msg in dl_errors.items())
@@ -334,6 +405,30 @@ def main():
         '--no-check-target', dest='check_target', action='store_false',
         help='Always re-download and re-upload even if destination file exists. Useful when the bbox changed.',
     )
+    parser.add_argument(
+        '--max-retries', type=int,
+        help='Max retries per date when both CEDA variants fail (default: TOML or 3).',
+    )
+    parser.add_argument(
+        '--retry-initial-delay', type=int,
+        help='Seconds to wait before the first retry (default: TOML or 30).',
+    )
+    parser.add_argument(
+        '--retry-backoff', type=float,
+        help='Multiplier applied to delay after each retry (default: TOML or 2.0).',
+    )
+    parser.add_argument(
+        '--failures-file', type=Path,
+        help='Where to write the list of dates that still failed after retries '
+             '(one YYYY-MM-DD per line, empty if all succeeded). '
+             'Default: <parameters.toml dir>/failures.txt.',
+    )
+    parser.add_argument(
+        '--from-failures', type=Path,
+        help='Read input dates from this file (one YYYY-MM-DD per line; blank '
+             'lines and lines starting with # are ignored). Overrides '
+             '[dates].start_date / .end_date.',
+    )
     args = parser.parse_args()
 
     check_external_binaries()
@@ -345,10 +440,13 @@ def main():
     bounds = params.get('bounds') or {}
     remote_cfg = params.get('remote') or {}
 
-    for key in ('start_date', 'end_date'):
-        if key not in dates_cfg:
-            print(f'Error: missing [dates].{key} in {args.parameters_path}', file=sys.stderr)
-            sys.exit(1)
+    # [dates].start_date/end_date are only required when we're not loading the
+    # date list from a --from-failures file.
+    if args.from_failures is None:
+        for key in ('start_date', 'end_date'):
+            if key not in dates_cfg:
+                print(f'Error: missing [dates].{key} in {args.parameters_path}', file=sys.stderr)
+                sys.exit(1)
     for key in ('min_lon', 'max_lon', 'min_lat', 'max_lat'):
         if key not in bounds:
             print(f'Error: missing [bounds].{key} in {args.parameters_path}', file=sys.stderr)
@@ -358,16 +456,35 @@ def main():
         sys.exit(1)
     remote_path = remote_cfg.pop('path', '')
 
-    start_date = pendulum.parse(dates_cfg['start_date']).date()
-    end_date = pendulum.parse(dates_cfg['end_date']).date()
-    dates = list(date_range(start_date, end_date))
+    if args.from_failures is not None:
+        if not args.from_failures.is_file():
+            print(f'Error: --from-failures file not found: {args.from_failures}', file=sys.stderr)
+            sys.exit(1)
+        dates = load_failures_file(args.from_failures)
+        if not dates:
+            print(f'-- --from-failures: no dates to process in {args.from_failures}; exiting cleanly')
+            return
+        start_date = dates[0]
+        end_date = dates[-1]
+        print(f'-- --from-failures: loaded {len(dates)} dates from {args.from_failures}')
+    else:
+        start_date = pendulum.parse(dates_cfg['start_date']).date()
+        end_date = pendulum.parse(dates_cfg['end_date']).date()
+        dates = list(date_range(start_date, end_date))
 
     n_tasks = int(params.get('n_tasks', 4))
     check_target = bool(params.get('check_target', True))
+    max_retries = int(params.get('max_retries', 3))
+    retry_initial_delay = int(params.get('retry_initial_delay', 30))
+    retry_backoff = float(params.get('retry_backoff', 2.0))
+    failures_file = Path(params['failures_file']) if 'failures_file' in params \
+        else args.parameters_path.parent / 'failures.txt'
 
     print(f'-- CCI SST mirror: {len(dates)} days from {start_date} to {end_date}')
     print(f'-- bbox: lon[{bounds["min_lon"]},{bounds["max_lon"]}] lat[{bounds["min_lat"]},{bounds["max_lat"]}]')
     print(f'-- workers: {n_tasks}, check_target: {check_target}')
+    print(f'-- retries: max={max_retries}, initial_delay={retry_initial_delay}s, backoff={retry_backoff}x')
+    print(f'-- failures will be written to: {failures_file}')
 
     t1 = pendulum.now()
     counts = {'ok': 0, 'skip': 0, 'fail': 0}
@@ -379,7 +496,12 @@ def main():
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_tasks) as executor:
             futures = {
-                executor.submit(process_one_day, d, bounds, remote_path, config_path, workdir, check_target): d
+                executor.submit(
+                    process_one_day, d, bounds, remote_path, config_path, workdir, check_target,
+                    max_retries=max_retries,
+                    retry_initial_delay=retry_initial_delay,
+                    retry_backoff=retry_backoff,
+                ): d
                 for d in dates
             }
             for fut in concurrent.futures.as_completed(futures):
@@ -395,6 +517,16 @@ def main():
 
     elapsed = round((pendulum.now() - t1).total_seconds())
     print(f'-- Done in {elapsed}s. {counts["ok"]} uploaded, {counts["skip"]} skipped, {counts["fail"]} failed.')
+
+    # Write failures.txt unconditionally — empty file if all succeeded, so the file
+    # is always an authoritative record of the last run's state. MUST happen after
+    # the `with tempfile.TemporaryDirectory(...)` block above closes; we'd lose the
+    # file if the default location were inside workdir.
+    failures_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(failures_file, 'w') as f:
+        for date, _msg in failures:   # failures items are (date, msg) tuples
+            f.write(f'{date.format("YYYY-MM-DD")}\n')
+    print(f'-- failures recorded in {failures_file} (n={len(failures)})')
 
     if failures:
         sys.exit(1)

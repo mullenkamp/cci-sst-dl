@@ -14,6 +14,24 @@ For each date in the requested range:
 
 Re-runs are idempotent: before touching CEDA, the script checks the destination with `rclone lsf` and skips any day already present. Set `check_target = false` in the TOML (or pass `--no-check-target`) to force re-download and re-upload — useful when you change the bbox and want to refresh existing files.
 
+### Handling transient CEDA failures
+
+CEDA occasionally returns `error reading source root directory: error listing "": directory not found` for files that actually exist — backend hiccups that resolve themselves within minutes-to-hours. The script handles these in two ways:
+
+1. **Per-date exponential-backoff retries during the run.** If *both* the CDR and ICDR variants fail for a date, the script sleeps and tries the pair again. Defaults: 3 retries, 30 s initial delay, 2.0× backoff → base delays of 30 s, 60 s, 120 s, with ±50% uniform jitter applied per worker (so eight parallel workers don't all wake at the same instant and re-trigger CEDA's rate limiter). Configurable via `max_retries` / `retry_initial_delay` / `retry_backoff` in TOML or the matching `--max-retries` / `--retry-initial-delay` / `--retry-backoff` CLI flags. The common-case success path (CDR succeeds first try) has zero overhead — no sleeps, no extra log lines.
+
+2. **Failures-list file for surgical re-runs.** At end of run the script writes a one-date-per-line file (default: `failures.txt` alongside `parameters.toml`) listing dates that still failed after retries. Re-run the script with `--from-failures path/to/failures.txt` to re-process **only** those dates, skipping the `[dates]` range entirely. The file is overwritten on every run so it always reflects the latest state; iterating until it's empty converges to a complete archive without re-downloading any successful days.
+
+   ```bash
+   # First run — full range
+   python cci_sst_download.py parameters.toml
+   # → writes ./failures.txt with whatever didn't recover after retries
+
+   # Re-run later (CEDA usually recovers within hours)
+   python cci_sst_download.py parameters.toml --from-failures ./failures.txt
+   # → overwrites ./failures.txt with what STILL failed; ideally empty
+   ```
+
 ## Data source
 
 ESA Sea Surface Temperature Climate Change Initiative (ESA SST_cci) Level 4 Analysis, version 3.0, hosted by CEDA:
@@ -69,11 +87,19 @@ See `python cci_sst_download.py --help`.
 |---------|-----|------|-------------|
 | (root) | `n_tasks` | int | Parallel workers. Default 4. |
 | (root) | `check_target` | bool | Skip days already present on the destination. Default `true`. Set `false` to overwrite (e.g. after changing bbox). CLI: `--check-target` / `--no-check-target`. |
-| `[dates]` | `start_date` | string | `YYYY-MM-DD`. Inclusive. |
-| `[dates]` | `end_date` | string | `YYYY-MM-DD`. Inclusive. |
+| (root) | `max_retries` | int | Number of retries per date when both CEDA variants fail. Default 3. CLI: `--max-retries`. |
+| (root) | `retry_initial_delay` | int | Seconds to wait before the first retry. Default 30. CLI: `--retry-initial-delay`. |
+| (root) | `retry_backoff` | float | Multiplier applied to the delay after each retry. Default 2.0. CLI: `--retry-backoff`. |
+| (root) | `failures_file` | string | Path to write the post-run failures list (one `YYYY-MM-DD` per line, empty if all succeeded). Default `<parameters.toml dir>/failures.txt`. CLI: `--failures-file`. |
+| `[dates]` | `start_date` | string | `YYYY-MM-DD`. Inclusive. Ignored when `--from-failures` is given. |
+| `[dates]` | `end_date` | string | `YYYY-MM-DD`. Inclusive. Ignored when `--from-failures` is given. |
 | `[bounds]` | `min_lon`/`max_lon` | float | Longitude bbox (-180..180). |
 | `[bounds]` | `min_lat`/`max_lat` | float | Latitude bbox (-90..90). |
 | `[remote]` | various | - | rclone config. `type`, `provider`, `endpoint`, `access_key_id`, `secret_access_key`, `path` for S3. Or `type='local'` + `path` for a local directory. |
+
+CLI-only flags (no TOML equivalent):
+
+- `--from-failures PATH` — read input dates from a one-`YYYY-MM-DD`-per-line file instead of using `[dates].start_date/end_date`. Blank lines and lines starting with `#` are ignored. Pair with a previous run's `failures.txt` for surgical re-runs.
 
 ## Output layout on the destination
 
@@ -105,6 +131,12 @@ The image bundles `cdo` and `rclone`. The `user:` directive in `docker-compose.y
 
 For `[remote]` type='local', uncomment the `~/data/sst/cci_v3:/data/output` volume mount in `docker-compose.yml` (and set `path = '/data/output'` in your TOML) so the clipped NetCDFs land on your host filesystem owned by your user.
 
+The host project dir is mounted at `/work` and the entry-point passes `--failures-file /work/failures.txt`, so the post-run failures list appears in the host project dir alongside `parameters.toml` automatically. To re-run only those failures:
+
+```bash
+docker compose run --rm cci-sst-dl --from-failures /work/failures.txt
+```
+
 ### Behind an HTTP proxy (university / corporate networks)
 
 `docker-compose.yml` already forwards `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` (plus lowercase variants) from the host. Just export them before running:
@@ -122,5 +154,5 @@ Both `curl` (CEDA download) and `rclone` (Mega upload) respect these. If your pr
 
 - CEDA serves anonymously over HTTPS; no login needed.
 - The script tries `CDR3.0` first for years ≤ 2021 and `ICDR3.0` for 2022+, falling back to the other on 404 (robust to future boundary shifts).
-- If a date is outside the archive's coverage (e.g. post-2024-06), the script logs the failure for that date and continues, exiting non-zero at the end.
+- Genuinely-missing dates (e.g. post-2024-06) will still fail after retries are exhausted — they end up in `failures.txt` like any other failure, and the run exits non-zero. Inspect `failures.txt` to distinguish "CEDA was flaky, try again later" from "this date doesn't exist".
 - Clipped file sizes depend on bbox; a ~30°×30° region is typically ~300-500 KB vs 16 MB unclipped.

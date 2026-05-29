@@ -14,4 +14,11 @@ RUN mkdir -p /data/output && chmod 777 /data/output
 
 ENV PYTHONUNBUFFERED=1
 
-ENTRYPOINT ["python3", "/app/cci_sst_download.py", "/parameters.toml"]
+# --failures-file pins the post-run failures list to a known mounted path
+# (docker-compose.yml mounts the host project dir at /work). Without this,
+# the default `<parameters.toml dir>/failures.txt` would land at
+# `/failures.txt` inside the container, which is NOT a mounted volume — so
+# the file would vanish on container exit. Users can still override by
+# passing --failures-file <other path> on the command line (argparse takes
+# the last occurrence).
+ENTRYPOINT ["python3", "/app/cci_sst_download.py", "/parameters.toml", "--failures-file", "/work/failures.txt"]
