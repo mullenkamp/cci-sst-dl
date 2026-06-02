@@ -50,9 +50,9 @@ FILENAME_TMPL = (
 # Use cdo sellonlatbox instead of ncks: handles dateline-wrapping bboxes
 # (e.g. lon 145..195 on a -180..180 source produces a single contiguous lon
 # array from 145.025 to 194.975). ncks silently clamps such bboxes to 180.
-# -f nc4c + -z zip_3 gives NetCDF-4 classic with deflate compression.
+# -f nc4c + -z zip_3 gives NetCDF-4 with deflate compression.
 CLIP_STR_FORMAT = (
-    'cdo -s -O -f nc4c -z zip_3 '
+    'cdo -s -O -f nc4 -z zip_3 '
     'sellonlatbox,{min_lon:.6f},{max_lon:.6f},{min_lat:.6f},{max_lat:.6f} '
     '{src} {dst}'
 )
