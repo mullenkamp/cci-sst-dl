@@ -41,9 +41,9 @@ retry_backoff = 2.0              # multiplier applied after each retry
 # failures_file = '/data/output/failures.txt'
 
 # =============================================================================
-# Date range (inclusive). CEDA v3 currently covers 1980-01-01 through 2024-06-22
-# (verified 2026-04; the archive has not been extended past mid-2024 despite the
-# catalogue claiming daily ICDR updates).
+# Date range (inclusive). Sources (cci-sst-dl >= 0.3.0 picks per date, falling back to the other):
+# CEDA v3 1980-01-01 .. 2024-06-22; the ICDR extension from 2024-06-23 is on the public JASMIN
+# workspace (cds_c3s_sst), about a month behind present (checked 2026-10-27).
 #
 # Ignored when --from-failures is given.
 # =============================================================================
