@@ -1,6 +1,6 @@
 # cci-sst-dl
 
-Minimal standalone script to mirror ESA CCI SST v3.0 L4 daily NetCDFs from CEDA into your own S3 bucket, clipped to a region of interest. Intended as a companion to [wrf-auto-runs](https://github.com/envlib/wrf-auto-runs) when using CCI SST as the boundary SST source.
+Minimal standalone script to mirror ESA CCI SST v3.0 L4 daily NetCDFs from CEDA (and, from 2024-06-23, the public JASMIN workspace that now holds the ICDR extension) into your own S3 bucket, clipped to a region of interest. Intended as a companion to [wrf-auto-runs](https://github.com/envlib/wrf-auto-runs) when using CCI SST as the boundary SST source.
 
 Sibling in spirit to [era5-download](https://github.com/envlib/era5-download), but deliberately much smaller: one script, argparse CLI, no Python package.
 
@@ -8,8 +8,8 @@ Sibling in spirit to [era5-download](https://github.com/envlib/era5-download), b
 
 For each date in the requested range:
 
-1. Downloads the global daily NetCDF (~16 MB) from CEDA anonymously over HTTP.
-2. Clips to a user-specified lat/lon bbox with `ncks` (NCO).
+1. Downloads the global daily NetCDF (~16 MB) anonymously over HTTP: from the source that holds the date first (CEDA to 2024-06-22, JASMIN from 2024-06-23), then the other.
+2. Clips to a user-specified lat/lon bbox with `cdo`.
 3. Uploads the clipped file to an rclone-configured S3 (or local) destination, preserving the original filename and placing it under `{remote.path}/{YYYY}/`.
 
 Re-runs are idempotent: before touching CEDA, the script checks the destination with `rclone lsf` and skips any day already present. Set `check_target = false` in the TOML (or pass `--no-check-target`) to force re-download and re-upload — useful when you change the bbox and want to refresh existing files.
@@ -34,10 +34,11 @@ CEDA occasionally returns `error reading source root directory: error listing ""
 
 ## Data source
 
-ESA Sea Surface Temperature Climate Change Initiative (ESA SST_cci) Level 4 Analysis, version 3.0, hosted by CEDA:
+ESA Sea Surface Temperature Climate Change Initiative (ESA SST_cci) Level 4 Analysis, version 3.0, in two places with the same `YYYY/MM/DD/<file>` layout and filenames:
 
-- **Base URL**: https://dap.ceda.ac.uk/neodc/eocis/data/global_and_regional/sea_surface_temperature/CDR_v3/Analysis/L4/v3.0.1
-- **Coverage**: 1980-01-01 to ~2024-06-22 (the archive has not been updated since mid-2024 despite the catalogue claiming daily ICDR updates)
+- **CEDA**: https://dap.ceda.ac.uk/neodc/eocis/data/global_and_regional/sea_surface_temperature/CDR_v3/Analysis/L4/v3.0.1 — 1980-01-01 to 2024-06-22
+- **JASMIN** (the ICDR extension, public group workspace): https://gws-access.jasmin.ac.uk/public/cds_c3s_sst/data/ICDR_v3/Analysis/L4/v3.0.1 — 2024-06-23 onward, updated about a month behind present (checked 2026-10-27: through 2026-10-10). A 2025 file from here is identical (same `id`, `product_version` 3.0.1 and per-file `date_created`) to the copy CEDA served before the move.
+- The split date is `JASMIN_FROM` in the script; each date falls back to the other source on failure, so a later move either way still downloads.
 - **Grid**: 0.05° global lat-lon
 - **Variables**: `analysed_sst` (K), `sea_ice_fraction`, `mask`, `analysis_uncertainty`
 - **Filename**: `YYYYMMDD120000-ESACCI-L4_GHRSST-SSTdepth-OSTIA-GLOB_{CDR3.0|ICDR3.0}-v02.0-fv01.0.nc` — `CDR3.0` for years ≤ 2021, `ICDR3.0` for 2022+
@@ -152,7 +153,7 @@ Both `curl` (CEDA download) and `rclone` (Mega upload) respect these. If your pr
 
 ## Notes
 
-- CEDA serves anonymously over HTTPS; no login needed.
+- CEDA and JASMIN both serve anonymously over HTTPS; no login needed.
 - The script tries `CDR3.0` first for years ≤ 2021 and `ICDR3.0` for 2022+, falling back to the other on 404 (robust to future boundary shifts).
-- Genuinely-missing dates (e.g. post-2024-06) will still fail after retries are exhausted — they end up in `failures.txt` like any other failure, and the run exits non-zero. Inspect `failures.txt` to distinguish "CEDA was flaky, try again later" from "this date doesn't exist".
+- Genuinely-missing dates (e.g. beyond the ICDR's latest day, about a month behind present) will still fail after retries are exhausted — they end up in `failures.txt` like any other failure, and the run exits non-zero. Inspect `failures.txt` to distinguish "CEDA was flaky, try again later" from "this date doesn't exist".
 - Clipped file sizes depend on bbox; a ~30°×30° region is typically ~300-500 KB vs 16 MB unclipped.

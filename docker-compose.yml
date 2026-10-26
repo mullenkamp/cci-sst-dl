@@ -1,7 +1,7 @@
 services:
   cci-sst-dl:
     build: .
-    image: mullenkamp/cci-sst-dl:0.2
+    image: mullenkamp/cci-sst-dl:0.3
     # Run as the host user so files written to mounted volumes (when using
     # [remote] type='local') are owned by you, not root. Export UID and GID
     # in the shell before invoking:

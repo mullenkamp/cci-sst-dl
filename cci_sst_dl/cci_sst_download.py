@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Download ESA CCI SST v3.0 L4 daily NetCDFs from CEDA, clip each to a regional
-bbox with ncks, and upload to an rclone-configured S3 (or local) destination.
+Download ESA CCI SST v3.0 L4 daily NetCDFs from CEDA (and, from 2024-06-23, the
+public JASMIN workspace that now holds the ICDR extension), clip each to a regional
+bbox with cdo, and upload to an rclone-configured S3 (or local) destination.
 
 Intentionally lightweight: one file, argparse-based CLI, no Python package,
 no tests. Sibling in spirit to `era5-download` but much smaller.
 
-Source: https://dap.ceda.ac.uk/neodc/eocis/data/global_and_regional/sea_surface_temperature/CDR_v3/Analysis/L4/v3.0.1
+Sources (same v3.0.1 layout and filenames; each date tries its primary source first, then the other):
+  CEDA   https://dap.ceda.ac.uk/neodc/eocis/data/global_and_regional/sea_surface_temperature/CDR_v3/Analysis/L4/v3.0.1
+         1980-01-01 .. 2024-06-22 (CDR to 2021, ICDR 2022 onward)
+  JASMIN https://gws-access.jasmin.ac.uk/public/cds_c3s_sst/data/ICDR_v3/Analysis/L4/v3.0.1
+         2024-06-23 onward (the ICDR extension; checked 2026-10-27: through 2026-10-10, files identical to
+         those CEDA served for 2025)
 License: CC-BY 4.0 (credit Merchant et al. 2019, doi:10.1038/s41597-019-0236-x)
 
 External binaries required: cdo, rclone.
@@ -38,6 +44,12 @@ CEDA_BASE = (
     'https://dap.ceda.ac.uk/neodc/eocis/data/global_and_regional/'
     'sea_surface_temperature/CDR_v3/Analysis/L4/v3.0.1'
 )
+
+# The ICDR extension moved off CEDA: CEDA's tree ends 2024-06-22 and the public JASMIN workspace starts 2024-06-23
+# (both checked 2026-10-27). Dates from JASMIN_FROM try JASMIN first, earlier dates CEDA first; each falls back to
+# the other, so a later move in either direction still downloads.
+JASMIN_BASE = 'https://gws-access.jasmin.ac.uk/public/cds_c3s_sst/data/ICDR_v3/Analysis/L4/v3.0.1'
+JASMIN_FROM = (2024, 6, 23)
 
 # year <= CDR_LAST_YEAR → CDR3.0, else ICDR3.0
 CDR_LAST_YEAR = 2021
@@ -132,16 +144,24 @@ def date_range(start_date, end_date):
         curr = curr.add(days=1)
 
 
-def build_url(date, variant):
+def build_url(date, variant, base=CEDA_BASE):
     filename = FILENAME_TMPL.format(yyyymmdd=date.format('YYYYMMDD'), variant=variant)
-    url = f'{CEDA_BASE}/{date.format("YYYY")}/{date.format("MM")}/{date.format("DD")}/{filename}'
+    url = f'{base}/{date.format("YYYY")}/{date.format("MM")}/{date.format("DD")}/{filename}'
     return url, filename
+
+
+def sources_for_date(date):
+    """rclone source remotes in the order to try: the one that holds this date first."""
+    if (date.year, date.month, date.day) >= JASMIN_FROM:
+        return ('jasmin', 'ceda')
+    return ('ceda', 'jasmin')
 
 
 def create_rclone_config(config_dict, config_path):
     """Write two rclone config entries:
       - 'sst'  : the upload destination (user's S3 or local, from [remote] TOML)
       - 'ceda' : anonymous HTTP remote pointing at the CEDA v3 archive base URL
+      - 'jasmin' : anonymous HTTP remote pointing at the JASMIN ICDR workspace (2024-06-23 onward)
     """
     # Upload destination
     type_ = config_dict['type']
@@ -151,6 +171,10 @@ def create_rclone_config(config_dict, config_path):
 
     # CEDA download source (HTTP remote, no auth)
     cmd = f'rclone config create ceda http url={CEDA_BASE}/ --config={config_path} --non-interactive'
+    subprocess.run(shlex.split(cmd), capture_output=True, text=True, check=True)
+
+    # JASMIN download source for the ICDR extension (HTTP remote, no auth)
+    cmd = f'rclone config create jasmin http url={JASMIN_BASE}/ --config={config_path} --non-interactive'
     subprocess.run(shlex.split(cmd), capture_output=True, text=True, check=True)
 
 
@@ -183,18 +207,19 @@ def remote_has_day(date, remote_path, config_path):
 
 def download_day(date, dl_dir, config_path,
                  max_retries=3, retry_initial_delay=30, retry_backoff=2.0):
-    """Download the day's NetCDF via rclone from the 'ceda:' http remote.
+    """Download the day's NetCDF via rclone from the 'ceda:' or 'jasmin:' http remote.
 
-    Tries the year-appropriate variant first, falls back to the other on failure.
-    If BOTH variants fail in one round, sleep with exponential backoff and retry
-    up to max_retries times — this handles transient CEDA "directory not found"
+    Tries the date's primary source (sources_for_date), then the other; within each, the year-appropriate variant
+    first, then the other. Only if EVERY source and variant fails in one round does it sleep with exponential backoff
+    and retry -- a 404 from the source that does not hold the date costs one quick request, never a sleep.
+    The backoff retries up to max_retries times — this handles transient CEDA "directory not found"
     errors where the file does exist but the server momentarily can't serve it.
     rclone's own --retries / --low-level-retries flags only cover transient
     connection errors within a single invocation; a 404 is treated as permanent
     and gives up immediately, so this outer loop is what saves the day.
 
-    Returns (dst_path, filename, errors) where errors is {variant: rclone_stderr}
-    for any variant that failed in the final attempt. Successful downloads
+    Returns (dst_path, filename, errors) where errors is {"source:variant": rclone_stderr}
+    for any attempt that failed in the final round. Successful downloads
     return (path, name, {}).
     """
     primary, fallback = expected_variants_for_year(date.year)
@@ -203,26 +228,27 @@ def download_day(date, dl_dir, config_path,
 
     for attempt in range(max_retries + 1):
         errors = {}
-        for variant in (primary, fallback):
-            _, filename = build_url(date, variant)
-            # rclone expects a path relative to the 'ceda:' remote's base URL.
-            remote_rel = f'{date.format("YYYY")}/{date.format("MM")}/{date.format("DD")}/{filename}'
-            dst = dl_dir / filename
-            # `copyto` lets us specify the exact destination filename.
-            cmd = [
-                'rclone', 'copyto', f'ceda:{remote_rel}', str(dst),
-                '--config', str(config_path),
-                '--retries', '3',
-                '--low-level-retries', '5',
-                '--contimeout', '30s',
-                '--timeout', '5m',
-            ]
-            p = subprocess.run(cmd, capture_output=True, text=True)
-            if p.returncode == 0 and dst.exists():
-                return dst, filename, {}
-            errors[variant] = (p.stderr or p.stdout or f'exit code {p.returncode}').strip()
+        for source in sources_for_date(date):
+            for variant in (primary, fallback):
+                _, filename = build_url(date, variant)
+                # rclone expects a path relative to the remote's base URL (same layout on both sources).
+                remote_rel = f'{date.format("YYYY")}/{date.format("MM")}/{date.format("DD")}/{filename}'
+                dst = dl_dir / filename
+                # `copyto` lets us specify the exact destination filename.
+                cmd = [
+                    'rclone', 'copyto', f'{source}:{remote_rel}', str(dst),
+                    '--config', str(config_path),
+                    '--retries', '3',
+                    '--low-level-retries', '5',
+                    '--contimeout', '30s',
+                    '--timeout', '5m',
+                ]
+                p = subprocess.run(cmd, capture_output=True, text=True)
+                if p.returncode == 0 and dst.exists():
+                    return dst, filename, {}
+                errors[f'{source}:{variant}'] = (p.stderr or p.stdout or f'exit code {p.returncode}').strip()
 
-        # Both variants failed this attempt. Back off and try again if we have retries left.
+        # Every source and variant failed this attempt. Back off and try again if we have retries left.
         if attempt < max_retries:
             # Jitter the actual sleep over [0.5*delay, 1.5*delay) so parallel workers
             # don't all wake at the exact same instant and re-trigger CEDA's rate
@@ -231,7 +257,7 @@ def download_day(date, dl_dir, config_path,
             sleep_s = max(1, int(delay * (0.5 + random.random())))
             print(
                 f'[retry {attempt+1}/{max_retries}] {date.format("YYYY-MM-DD")}: '
-                f'both variants failed; sleeping {sleep_s}s before next attempt',
+                f'every source and variant failed; sleeping {sleep_s}s before next attempt',
                 flush=True,
             )
             time.sleep(sleep_s)
@@ -387,7 +413,7 @@ def process_one_day(date, bounds, remote_path, config_path, workdir, check_targe
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Download ESA CCI SST v3 daily NetCDFs from CEDA, clip, upload.'
+        description='Download ESA CCI SST v3 daily NetCDFs from CEDA / JASMIN, clip, upload.'
     )
     parser.add_argument('parameters_path', type=Path, help='TOML config file path.')
     parser.add_argument('-s', '--start-date', help='Override [dates].start_date (YYYY-MM-DD).')
@@ -407,7 +433,7 @@ def main():
     )
     parser.add_argument(
         '--max-retries', type=int,
-        help='Max retries per date when both CEDA variants fail (default: TOML or 3).',
+        help='Max retries per date when every source and variant fails (default: TOML or 3).',
     )
     parser.add_argument(
         '--retry-initial-delay', type=int,
